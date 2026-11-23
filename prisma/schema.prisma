@@ -1,0 +1,467 @@
+// Quorum data model.
+//
+// Written to be portable: SQLite today, PostgreSQL (Neon) later. No native DB types, no scalar lists,
+// no @map. To move to Postgres change `provider` below and regenerate the baseline migration
+// (see docs/deployment.md). The privacy-critical boundary is the split between:
+//
+//   EligibleVoter / Attendance / VotingCredential   ("who took part")
+//   Ballot / BallotSelection                        ("what was chosen")
+//
+// There is deliberately NO foreign key, shared id, or timestamp precision that joins the two sides.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ─────────────────────────── Authentication (Better Auth) ───────────────────────────
+
+model User {
+  id            String       @id
+  name          String
+  email         String       @unique
+  emailVerified Boolean      @default(false)
+  image         String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  sessions      Session[]
+  accounts      Account[]
+  memberships   Membership[]
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}
+
+// ─────────────────────────── Tenancy ───────────────────────────
+
+enum MemberRole {
+  OWNER
+  ADMIN
+}
+
+model Organization {
+  id          String       @id @default(cuid())
+  name        String
+  slug        String       @unique
+  description String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  memberships Membership[]
+  invitations Invitation[]
+  elections   Election[]
+  uploads     Upload[]
+}
+
+model Membership {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           MemberRole
+  createdAt      DateTime     @default(now())
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+
+// Invite links. Only a keyed hash of the token is stored; the link is shown once.
+model Invitation {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  email          String?
+  role           MemberRole   @default(ADMIN)
+  tokenHash      String       @unique
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  createdById    String
+  createdAt      DateTime     @default(now())
+
+  @@index([organizationId])
+}
+
+// ─────────────────────────── Elections ───────────────────────────
+
+enum ElectionStatus {
+  DRAFT
+  SCHEDULED
+  OPEN
+  CLOSED
+  PUBLISHED
+}
+
+enum EligibilityMode {
+  OPEN
+  RESTRICTED
+}
+
+enum ResultsDisclosure {
+  LIVE
+  AFTER_CLOSE
+}
+
+enum TieRule {
+  REPORT_TIE
+  REQUIRE_RUNOFF
+}
+
+model Election {
+  id                   String            @id @default(cuid())
+  organizationId       String
+  organization         Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  title                String
+  description          String?
+  timezone             String            @default("UTC")
+  // Upload ids (no FK on purpose: assets are optional and independently purgeable).
+  bannerUploadId       String?
+  logoUploadId         String?
+  status               ElectionStatus    @default(DRAFT)
+  eligibilityMode      EligibilityMode   @default(RESTRICTED)
+  // JSON array of { key, label, kind, secret }. Order matters: it defines the lookup key layout.
+  verificationFields   Json
+  startsAt             DateTime?
+  endsAt               DateTime?
+  // startsAt - 24h. Roster edits are rejected once now >= rosterFreezeAt (enforced in transactions).
+  rosterFreezeAt       DateTime?
+  // Set the first time the freeze is enforced. Never cleared: a frozen roster stays frozen.
+  rosterFrozenAt       DateTime?
+  resultsDisclosure    ResultsDisclosure @default(AFTER_CLOSE)
+  autoPublish          Boolean           @default(false)
+  tieRule              TieRule           @default(REPORT_TIE)
+  credentialTtlSeconds Int               @default(900)
+  // Unguessable capability tokens for the two public surfaces.
+  voterSlug            String            @unique
+  resultsSlug          String            @unique
+  openedAt             DateTime?
+  closedAt             DateTime?
+  publishedAt          DateTime?
+  createdById          String
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+  positions            Position[]
+  imports              RosterImport[]
+  voters               EligibleVoter[]
+  credentials          VotingCredential[]
+  ballots              Ballot[]
+  openMarks            OpenAccessMark[]
+
+  @@index([organizationId, status])
+  @@index([status, startsAt])
+  @@index([status, endsAt])
+}
+
+model Position {
+  id            String      @id @default(cuid())
+  electionId    String
+  election      Election    @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  title         String
+  description   String?
+  sortOrder     Int
+  // How many choices a voter may mark, and how many seats the position fills.
+  maxSelections Int         @default(1)
+  seats         Int         @default(1)
+  allowAbstain  Boolean     @default(true)
+  createdAt     DateTime    @default(now())
+  candidates    Candidate[]
+
+  @@index([electionId, sortOrder])
+}
+
+model Candidate {
+  id            String            @id @default(cuid())
+  positionId    String
+  position      Position          @relation(fields: [positionId], references: [id], onDelete: Cascade)
+  name          String
+  bio           String?
+  imageUploadId String?
+  sortOrder     Int
+  createdAt     DateTime          @default(now())
+  selections    BallotSelection[]
+
+  @@index([positionId, sortOrder])
+}
+
+// ─────────────────────────── Uploads and roster import ───────────────────────────
+
+enum UploadKind {
+  ROSTER
+  BANNER
+  LOGO
+  CANDIDATE_IMAGE
+}
+
+enum UploadStatus {
+  PENDING
+  UPLOADED
+  REJECTED
+  DELETED
+}
+
+model Upload {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  electionId     String?
+  kind           UploadKind
+  status         UploadStatus @default(PENDING)
+  objectKey      String       @unique
+  filename       String
+  contentType    String
+  declaredSize   Int
+  actualSize     Int?
+  sha256         String?
+  createdById    String
+  createdAt      DateTime     @default(now())
+  expiresAt      DateTime
+  deletedAt      DateTime?
+  imports        RosterImport[]
+
+  @@index([organizationId])
+  @@index([electionId, kind])
+  @@index([status, expiresAt])
+}
+
+enum ImportStatus {
+  AWAITING_UPLOAD
+  UPLOADED
+  PARSING
+  NEEDS_REVIEW
+  CONFIRMING
+  IMPORTED
+  REJECTED
+  FAILED
+}
+
+model RosterImport {
+  id              String            @id @default(cuid())
+  electionId      String
+  election        Election          @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  uploadId        String?
+  upload          Upload?           @relation(fields: [uploadId], references: [id], onDelete: SetNull)
+  status          ImportStatus      @default(AWAITING_UPLOAD)
+  // csv | pdf | docx | png | jpeg | manual
+  sourceKind      String
+  // Original file name only (sanitised). Never any row data.
+  originalName    String?
+  extractor       String?
+  // Detected source column headers (not values).
+  columns         Json
+  // { [targetKey]: sourceColumn } where targetKey is a verification field key, "__label" or "__group".
+  mapping         Json?
+  // Counts only: { total, ok, warning, error, duplicate, ambiguous, skipped, imported }
+  stats           Json?
+  errorCode       String?
+  idempotencyKey  String?
+  createdById     String
+  confirmedById   String?
+  createdAt       DateTime          @default(now())
+  // Set when a parse job claims the import; lets the sweeper recover jobs that died mid-way.
+  parseStartedAt  DateTime?
+  parsedAt        DateTime?
+  confirmedAt     DateTime?
+  // Set when staged rows and the raw upload were scrubbed.
+  purgedAt        DateTime?
+  rows            RosterImportRow[]
+
+  @@unique([electionId, idempotencyKey])
+  @@index([electionId, status])
+}
+
+enum RowStatus {
+  OK
+  WARNING
+  ERROR
+  DUPLICATE
+  AMBIGUOUS
+  SKIPPED
+}
+
+model RosterImportRow {
+  id            String       @id @default(cuid())
+  importId      String
+  import        RosterImport @relation(fields: [importId], references: [id], onDelete: Cascade)
+  rowIndex      Int
+  // AES-256-GCM envelope of the JSON cells ({ [sourceColumn]: value }). Cleared after confirm/reject.
+  payloadSealed String?
+  status        RowStatus    @default(OK)
+  // Issue codes only, e.g. ["missing:email","duplicate:exact"]. Never values.
+  issues        Json
+  confidence    Float?
+  // KEEP | SKIP chosen by the admin for DUPLICATE / AMBIGUOUS rows.
+  resolution    String?
+  createdAt     DateTime     @default(now())
+
+  @@unique([importId, rowIndex])
+  @@index([importId, status])
+}
+
+// ─────────────────────────── Who took part ───────────────────────────
+
+// Minimal eligibility record. Verification identifiers are never stored in the clear: lookupKey is an
+// HMAC (server-held key) over the normalised verification fields, primaryKey an HMAC over the first
+// field only (used to detect ambiguous roster rows). The roll-call label is AES-GCM sealed.
+model EligibleVoter {
+  id          String      @id @default(cuid())
+  electionId  String
+  election    Election    @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  lookupKey   String
+  primaryKey  String
+  labelSealed String
+  groupLabel  String?
+  importId    String?
+  createdAt   DateTime    @default(now())
+  attendance  Attendance?
+
+  @@unique([electionId, lookupKey])
+  @@index([electionId, primaryKey])
+}
+
+enum AttendanceState {
+  CHECKED_IN
+  VOTED
+}
+
+// One row per voter who has checked in. Timestamps are truncated to the hour on purpose.
+model Attendance {
+  id              String           @id @default(cuid())
+  electionId      String
+  eligibleVoterId String           @unique
+  eligibleVoter   EligibleVoter    @relation(fields: [eligibleVoterId], references: [id], onDelete: Cascade)
+  state           AttendanceState  @default(CHECKED_IN)
+  checkedInHour   DateTime
+  votedHour       DateTime?
+  credentials     VotingCredential[]
+
+  @@index([electionId, state])
+}
+
+// Short-lived single-use credential issued after verification. Only a keyed hash is stored.
+model VotingCredential {
+  id           String      @id @default(cuid())
+  electionId   String
+  election     Election    @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  // Null for open-access elections (no roster, so nobody to mark).
+  attendanceId String?
+  attendance   Attendance? @relation(fields: [attendanceId], references: [id], onDelete: Cascade)
+  tokenHash    String      @unique
+  expiresAt    DateTime
+  // Truncated to the hour: replay prevention needs "consumed", not an exact time.
+  consumedAt   DateTime?
+  revokedAt    DateTime?
+  createdAt    DateTime    @default(now())
+
+  @@index([electionId, expiresAt])
+  @@index([attendanceId])
+}
+
+// Weak open-access guard: one accepted ballot per device cookie. Not proof of one-person-one-vote.
+model OpenAccessMark {
+  electionId String
+  election   Election @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  deviceHash String
+  createdAt  DateTime @default(now())
+
+  @@id([electionId, deviceHash])
+}
+
+// ─────────────────────────── What was chosen ───────────────────────────
+
+// Ballots carry NO voter, roster, attendance, credential or token reference, and no timestamp.
+// ids are random UUIDs (never time-ordered) so identifiers leak no ordering.
+model Ballot {
+  id         String            @id
+  electionId String
+  election   Election          @relation(fields: [electionId], references: [id], onDelete: Restrict)
+  selections BallotSelection[]
+
+  @@index([electionId])
+}
+
+model BallotSelection {
+  id          String     @id
+  ballotId    String
+  ballot      Ballot     @relation(fields: [ballotId], references: [id], onDelete: Restrict)
+  positionId  String
+  // Null means an explicit abstention on that position.
+  candidateId String?
+  candidate   Candidate? @relation(fields: [candidateId], references: [id], onDelete: Restrict)
+
+  @@unique([ballotId, positionId, candidateId])
+  @@index([positionId, candidateId])
+}
+
+// ─────────────────────────── Audit and infrastructure ───────────────────────────
+
+// Administrative audit trail. Append-only in the application; triggers (SQLite) / revoked grants
+// (Postgres) enforce it at the database. Never contains selections, tokens or roster values.
+model AuditEvent {
+  id             String   @id @default(cuid())
+  organizationId String
+  electionId     String?
+  actorId        String?
+  actorType      String   @default("USER")
+  action         String
+  targetType     String?
+  targetId       String?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  @@index([electionId, createdAt])
+  @@index([organizationId, createdAt])
+}
+
+// Fixed-window counters for the database-backed rate limiter (works on serverless, no Redis).
+model RateLimitBucket {
+  key         String
+  windowStart Int
+  count       Int
+
+  @@id([key, windowStart])
+  @@index([windowStart])
+}
